@@ -42,19 +42,24 @@ class Output(BaseModel):
 
 def normalize_text_for_parsing(text: str) -> str:
     """
-    Normalizes text to handle common PDF extraction issues:
-    - Replaces various whitespace characters with a single space.
-    - Replaces multiple newlines with single newlines.
-    - Strips leading/trailing whitespace from lines.
+    Normalizes text to handle common PDF extraction issues while preserving line structure:
+    - Replaces various unicode whitespace characters with standard space.
+    - Replaces multiple spaces within a line with a single space.
+    - Strips leading/trailing whitespace from each line.
+    - Consolidates multiple blank lines into a single blank line.
     """
-    # Replace non-breaking spaces and other unicode spaces with standard space
-    text = re.sub(r'[\u00A0\u200B\u2003\u2009]', ' ', text)
-    # Replace multiple spaces with a single space
-    text = re.sub(r'\s+', ' ', text)
-    # Replace multiple newlines with at most two newlines, then strip lines
-    text = re.sub(r'\n\s*\n', '\n\n', text) # Consolidate multiple blank lines
-    text = '\n'.join(line.strip() for line in text.split('\n')) # Strip each line
-    return text.strip()
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Replace unicode spaces and multiple spaces with a single space within the line
+        line = re.sub(r'[\u00A0\u200B\u2003\u2009\s]+', ' ', line).strip()
+        if line: # Only add non-empty lines
+            cleaned_lines.append(line)
+    
+    # Join lines and then consolidate multiple blank lines
+    cleaned_text = '\n'.join(cleaned_lines)
+    cleaned_text = re.sub(r'\n{2,}', '\n\n', cleaned_text) # Consolidate 2 or more newlines into two
+    return cleaned_text.strip()
 
 
 def find_procedure_block(text: str, procedure_code: str) -> Optional[str]:
@@ -70,11 +75,10 @@ def find_procedure_block(text: str, procedure_code: str) -> Optional[str]:
     # - \s* before and after the code
     # - Uses a non-greedy match (.*?) to capture content
     # - Lookahead for next procedure code or end of string.
-    #   Next code pattern is more flexible: starts with a word boundary \b,
-    #   then 3+ uppercase letters, then 2+ digits, then another word boundary.
-    #   This avoids matching "MEXIP01" within a larger word.
+    #   Next code pattern is more flexible: starts with 3+ uppercase letters,
+    #   then 2+ digits, on a new line. Removed \b for more flexibility.
     pattern = re.compile(
-        rf"({escaped_code}\s*.*?)(?=\n\s*\b[A-Z]{{3,}}[0-9]{{2,}}\b|\Z)",
+        rf"({escaped_code}\s*.*?)(?=\n\s*[A-Z]{{3,}}[0-9]{{2,}}|\Z)",
         re.DOTALL
     )
     
@@ -208,7 +212,7 @@ def parse_procedure_block(procedure_text: str, procedure_code: str) -> Procedure
     title = description.split('\n')[0].strip() if description else f"Isolation Procedure {procedure_code}"
 
     return ProcedureDetail(
-        code=procedure_code,
+        code=code,
         title=title,
         description=description,
         steps=parsed_steps
