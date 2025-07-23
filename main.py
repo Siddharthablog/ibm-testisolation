@@ -49,8 +49,10 @@ def find_procedure_block(text: str, procedure_code: str) -> Optional[str]:
     procedure_code = procedure_code.strip().upper()
     escaped_code = re.escape(procedure_code)
 
+    # Updated pattern to be more flexible with whitespace around the code
+    # and to capture until the next code or end of string.
     pattern = re.compile(
-        rf"({escaped_code}.*?)(?=\n[A-Z0-9]{{6,}}(?:\s|$)|\Z)",
+        rf"({escaped_code}\s*.*?)(?=\n\s*[A-Z0-9]{{6,}}(?:\s|$)|\Z)",
         re.DOTALL
     )
     match = pattern.search(text)
@@ -61,48 +63,53 @@ def find_procedure_block(text: str, procedure_code: str) -> Optional[str]:
 def parse_steps_from_text(steps_text: str) -> List[StepDetail]:
     """
     Parses a raw text block containing steps into a list of StepDetail objects.
-    Uses a multi-stage regex approach for better robustness.
+    Uses a single, robust regex to find each step.
     """
     parsed_steps: List[StepDetail] = []
     
-    # First, split the text into chunks based on the step number
-    step_chunks = re.split(r"^\s*(\d+)\.", steps_text, flags=re.MULTILINE)
+    # Regex to find each step:
+    # ^\s*(\d+)\.\s* : Matches step number (e.g., "1.") at the start of a line, captures number.
+    # (.*?) : Non-greedy capture of the instruction text.
+    # (?=\n\s*\d+\.|\Z) : Positive lookahead for the start of the next step or end of string.
+    step_pattern = re.compile(
+        r"^\s*(\d+)\.\s*(.*?)(?=\n\s*\d+\.|\Z)",
+        re.DOTALL | re.MULTILINE
+    )
     
-    # The first item is usually empty or pre-amble text
-    step_chunks = step_chunks[1:]
-    
-    # Process each pair of (step_number, content)
-    for i in range(0, len(step_chunks), 2):
-        step_number = step_chunks[i].strip()
-        step_content = step_chunks[i+1].strip()
+    for match in step_pattern.finditer(steps_text):
+        step_number = match.group(1).strip()
+        step_content = match.group(2).strip()
         
         instruction = step_content
         yes_action, no_action, continue_to_step, continue_to_procedure, ends_procedure = None, None, None, None, False
         
-        # Regex to find Yes/No blocks
-        yes_match = re.search(r"^Yes:\s*(.*)", step_content, re.DOTALL | re.MULTILINE)
-        no_match = re.search(r"^No:\s*(.*)", step_content, re.DOTALL | re.MULTILINE)
+        # Regex to find Yes/No blocks within the step content
+        # This now looks for "Yes:" or "No:" at the beginning of a line within the step content
+        yes_no_split = re.split(r"^(Yes:|No:)", step_content, flags=re.MULTILINE | re.IGNORECASE)
         
-        if yes_match or no_match:
-            # The instruction is everything before the first 'Yes:' or 'No:'
-            first_action_start = yes_match.start() if yes_match else no_match.start()
-            instruction = step_content[:first_action_start].strip()
+        if len(yes_no_split) > 1: # If Yes/No split found
+            instruction = yes_no_split[0].strip() # Instruction is before the first Yes/No
             
-            if yes_match:
-                yes_action = yes_match.group(1).strip()
-            if no_match:
-                no_action = no_match.group(1).strip()
+            # Iterate through the split parts to find Yes/No actions
+            for i in range(1, len(yes_no_split), 2):
+                action_type = yes_no_split[i].strip().lower()
+                action_content = yes_no_split[i+1].strip()
+                
+                if action_type == "yes:":
+                    yes_action = action_content
+                elif action_type == "no:":
+                    no_action = action_content
         
         # Find explicit flow control instructions
-        continue_step_match = re.search(r"continue with step '(\d+)'", step_content, re.IGNORECASE)
+        continue_step_match = re.search(r"continue with step “?(\d+)”?", step_content, re.IGNORECASE)
         if continue_step_match:
             continue_to_step = continue_step_match.group(1)
 
-        continue_proc_match = re.search(r"Use procedure “([A-Z0-9]+)”", step_content)
+        continue_proc_match = re.search(r"Use procedure “?([A-Z0-9]+)”?", step_content)
         if continue_proc_match:
             continue_to_procedure = continue_proc_match.group(1)
             
-        if re.search(r"This ends the procedure\.", step_content):
+        if re.search(r"This ends the procedure\.", step_content, re.IGNORECASE):
             ends_procedure = True
             
         parsed_steps.append(StepDetail(
@@ -123,20 +130,28 @@ def parse_procedure_block(procedure_text: str, procedure_code: str) -> Procedure
     steps_raw_text = procedure_text
 
     # Try to find the description (text between procedure code and "Procedure" heading)
+    # More flexible regex for "Procedure" heading
     description_match = re.search(
-        rf"^{re.escape(procedure_code)}\s*\n(.*?)(?=\nProcedure\n)",
+        rf"^{re.escape(procedure_code)}\s*\n(.*?)(?=\n\s*Procedure\s*\n)",
         procedure_text, re.DOTALL | re.MULTILINE
     )
     if description_match:
         description = description_match.group(1).strip()
         steps_raw_text = procedure_text[description_match.end():]
-        # Remove the "Procedure" heading to isolate the steps
+        # Remove the "Procedure" heading and any text before the first step
         steps_raw_text = re.sub(r"^\s*Procedure\s*\n", "", steps_raw_text, 1, re.MULTILINE)
+        # Further clean up any non-step text at the beginning of steps_raw_text
+        # This ensures parse_steps_from_text starts directly with steps
+        match_first_step = re.search(r"^\s*\d+\.", steps_raw_text, re.MULTILINE)
+        if match_first_step:
+            steps_raw_text = steps_raw_text[match_first_step.start():]
+        else:
+            steps_raw_text = "" # No steps found after description
 
     # Use the new, robust step parsing function
     parsed_steps = parse_steps_from_text(steps_raw_text)
 
-    # Extract a title from the first line of the description
+    # Extract a title from the first line of the description, or use a default
     title = description.split('\n')[0].strip() if description else f"Isolation Procedure {procedure_code}"
 
     return ProcedureDetail(
@@ -157,21 +172,30 @@ def get_suggested_action(query: str, procedure_details: ProcedureDetail) -> Opti
     for step in procedure_details.steps:
         lower_instruction = step.instruction.lower()
         
-        # Rule 1: Match for problems with I/O module validity
+        # Rule 1: Match for problems with I/O module validity (MEXIP01)
         if procedure_details.code == "MEXIP01" and ("invalid" in lower_query or "not supported" in lower_query):
-            if "location code" in lower_instruction:
-                return f"Based on the issue, start with step {step.step_number}: '{step.instruction}'. If a location code is not available, the recommended action is: '{step.no_action}'."
+            if "location code" in lower_instruction and step.step_number == "1":
+                if step.no_action:
+                    return f"Based on the issue, start with step {step.step_number}: '{step.instruction}'. If a location code is not available, the recommended action is: '{step.no_action}'."
+                else:
+                    return f"Based on the issue, start with step {step.step_number}: '{step.instruction}'."
         
-        # Rule 2: Match for problems with missing or undetected I/O modules
+        # Rule 2: Match for problems with missing or undetected I/O modules (MEXIP02)
         if procedure_details.code == "MEXIP02" and ("not detected" in lower_query or "missing" in lower_query):
-            if "required i/o module or enclosure services manager" in lower_instruction:
-                 return f"Based on the issue, start with step {step.step_number}: '{step.instruction}'. If the module is not detected, follow the instructions for the 'No' case."
+            if "required i/o module or enclosure services manager" in lower_instruction and step.step_number == "1":
+                 if step.no_action:
+                     return f"Based on the issue, start with step {step.step_number}: '{step.instruction}'. If the module is not detected, follow the instructions for the 'No' case: '{step.no_action}'."
+                 else:
+                     return f"Based on the issue, start with step {step.step_number}: '{step.instruction}'."
             if "present and properly seated" in lower_instruction:
-                 return f"Based on the issue, check step {step.step_number}: '{step.instruction}'. If the module is not present or properly seated, the recommended action is: '{step.no_action}'."
+                 if step.no_action:
+                     return f"Based on the issue, check step {step.step_number}: '{step.instruction}'. If the module is not present or properly seated, the recommended action is: '{step.no_action}'."
+                 else:
+                     return f"Based on the issue, check step {step.step_number}: '{step.instruction}'."
 
-        # Rule 3: Match for power-related issues
+        # Rule 3: Match for power-related issues (MEXIP03)
         if procedure_details.code == "MEXIP03" and "power problem" in lower_query:
-            if "verify the following led states" in lower_instruction:
+            if "verify the following led states" in lower_instruction and step.step_number == "4":
                 return f"Based on the issue, check step {step.step_number}: '{step.instruction}'. You need to verify the LED states on the power supplies."
 
     # If no specific rule matches, provide a generic suggestion.
