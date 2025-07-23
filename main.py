@@ -40,6 +40,23 @@ class Output(BaseModel):
 
 # --- Helper Functions for Text Parsing ---
 
+def normalize_text_for_parsing(text: str) -> str:
+    """
+    Normalizes text to handle common PDF extraction issues:
+    - Replaces various whitespace characters with a single space.
+    - Replaces multiple newlines with single newlines.
+    - Strips leading/trailing whitespace from lines.
+    """
+    # Replace non-breaking spaces and other unicode spaces with standard space
+    text = re.sub(r'[\u00A0\u200B\u2003\u2009]', ' ', text)
+    # Replace multiple spaces with a single space
+    text = re.sub(r'\s+', ' ', text)
+    # Replace multiple newlines with at most two newlines, then strip lines
+    text = re.sub(r'\n\s*\n', '\n\n', text) # Consolidate multiple blank lines
+    text = '\n'.join(line.strip() for line in text.split('\n')) # Strip each line
+    return text.strip()
+
+
 def find_procedure_block(text: str, procedure_code: str) -> Optional[str]:
     """
     Finds the raw text block for a given procedure code.
@@ -49,15 +66,26 @@ def find_procedure_block(text: str, procedure_code: str) -> Optional[str]:
     procedure_code = procedure_code.strip().upper()
     escaped_code = re.escape(procedure_code)
 
-    # Updated pattern to be more flexible with whitespace around the code
-    # and to capture until the next code or end of string.
+    # Updated pattern to be more flexible:
+    # - \s* before and after the code
+    # - Uses a non-greedy match (.*?) to capture content
+    # - Lookahead for next procedure code or end of string.
+    #   Next code pattern is more flexible: starts with a word boundary \b,
+    #   then 3+ uppercase letters, then 2+ digits, then another word boundary.
+    #   This avoids matching "MEXIP01" within a larger word.
     pattern = re.compile(
-        rf"({escaped_code}\s*.*?)(?=\n\s*[A-Z0-9]{{6,}}(?:\s|$)|\Z)",
+        rf"({escaped_code}\s*.*?)(?=\n\s*\b[A-Z]{{3,}}[0-9]{{2,}}\b|\Z)",
         re.DOTALL
     )
+    
+    print(f"DEBUG: find_procedure_block - Searching for code: {procedure_code}")
+    print(f"DEBUG: find_procedure_block - Pattern: {pattern.pattern}")
+
     match = pattern.search(text)
     if match:
+        print(f"DEBUG: find_procedure_block - Match found for {procedure_code}")
         return match.group(1).strip()
+    print(f"DEBUG: find_procedure_block - No match found for {procedure_code}")
     return None
 
 def parse_steps_from_text(steps_text: str) -> List[StepDetail]:
@@ -76,6 +104,8 @@ def parse_steps_from_text(steps_text: str) -> List[StepDetail]:
         re.DOTALL | re.MULTILINE
     )
     
+    print(f"DEBUG: parse_steps_from_text - Input steps_text (first 200 chars): {steps_text[:200]}...")
+
     for match in step_pattern.finditer(steps_text):
         step_number = match.group(1).strip()
         step_content = match.group(2).strip()
@@ -85,15 +115,16 @@ def parse_steps_from_text(steps_text: str) -> List[StepDetail]:
         
         # Regex to find Yes/No blocks within the step content
         # This now looks for "Yes:" or "No:" at the beginning of a line within the step content
-        yes_no_split = re.split(r"^(Yes:|No:)", step_content, flags=re.MULTILINE | re.IGNORECASE)
+        # Uses re.split to cleanly separate instruction from Yes/No branches
+        yes_no_split_parts = re.split(r"^(Yes:|No:)", step_content, flags=re.MULTILINE | re.IGNORECASE)
         
-        if len(yes_no_split) > 1: # If Yes/No split found
-            instruction = yes_no_split[0].strip() # Instruction is before the first Yes/No
+        if len(yes_no_split_parts) > 1: # If Yes/No split found
+            instruction = yes_no_split_parts[0].strip() # Instruction is before the first Yes/No
             
             # Iterate through the split parts to find Yes/No actions
-            for i in range(1, len(yes_no_split), 2):
-                action_type = yes_no_split[i].strip().lower()
-                action_content = yes_no_split[i+1].strip()
+            for i in range(1, len(yes_no_split_parts), 2):
+                action_type = yes_no_split_parts[i].strip().lower()
+                action_content = yes_no_split_parts[i+1].strip()
                 
                 if action_type == "yes:":
                     yes_action = action_content
@@ -101,11 +132,12 @@ def parse_steps_from_text(steps_text: str) -> List[StepDetail]:
                     no_action = action_content
         
         # Find explicit flow control instructions
-        continue_step_match = re.search(r"continue with step “?(\d+)”?", step_content, re.IGNORECASE)
+        # More flexible with quotes around step numbers/procedure codes
+        continue_step_match = re.search(r"continue with step [“\"']?(\d+)[”\"']?", step_content, re.IGNORECASE)
         if continue_step_match:
             continue_to_step = continue_step_match.group(1)
 
-        continue_proc_match = re.search(r"Use procedure “?([A-Z0-9]+)”?", step_content)
+        continue_proc_match = re.search(r"Use procedure [“\"']?([A-Z0-9]+)[”\"']?", step_content)
         if continue_proc_match:
             continue_to_procedure = continue_proc_match.group(1)
             
@@ -121,7 +153,8 @@ def parse_steps_from_text(steps_text: str) -> List[StepDetail]:
             continue_to_procedure=continue_to_procedure,
             ends_procedure=ends_procedure
         ))
-        
+    
+    print(f"DEBUG: parse_steps_from_text - Found {len(parsed_steps)} steps.")
     return parsed_steps
 
 def parse_procedure_block(procedure_text: str, procedure_code: str) -> ProcedureDetail:
@@ -130,16 +163,21 @@ def parse_procedure_block(procedure_text: str, procedure_code: str) -> Procedure
     steps_raw_text = procedure_text
 
     # Try to find the description (text between procedure code and "Procedure" heading)
-    # More flexible regex for "Procedure" heading
+    # More flexible regex for "Procedure" heading, allowing for variations in spacing
     description_match = re.search(
         rf"^{re.escape(procedure_code)}\s*\n(.*?)(?=\n\s*Procedure\s*\n)",
         procedure_text, re.DOTALL | re.MULTILINE
     )
+    
+    print(f"DEBUG: parse_procedure_block - Input procedure_text (first 200 chars): {procedure_text[:200]}...")
+
     if description_match:
         description = description_match.group(1).strip()
         steps_raw_text = procedure_text[description_match.end():]
+        
         # Remove the "Procedure" heading and any text before the first step
         steps_raw_text = re.sub(r"^\s*Procedure\s*\n", "", steps_raw_text, 1, re.MULTILINE)
+        
         # Further clean up any non-step text at the beginning of steps_raw_text
         # This ensures parse_steps_from_text starts directly with steps
         match_first_step = re.search(r"^\s*\d+\.", steps_raw_text, re.MULTILINE)
@@ -147,9 +185,24 @@ def parse_procedure_block(procedure_text: str, procedure_code: str) -> Procedure
             steps_raw_text = steps_raw_text[match_first_step.start():]
         else:
             steps_raw_text = "" # No steps found after description
+        print(f"DEBUG: parse_procedure_block - Description found. Steps raw text (first 200 chars): {steps_raw_text[:200]}...")
+    else:
+        print(f"DEBUG: parse_procedure_block - No description found before 'Procedure' heading. Assuming entire block is steps.")
+        # If no explicit "Procedure" heading, assume the entire block after the code is steps
+        # This might need adjustment based on actual document structure.
+        # For now, let's assume the description is just the line after the code if no "Procedure" is found.
+        lines = procedure_text.split('\n')
+        if len(lines) > 1:
+            description = lines[1].strip()
+            steps_raw_text = '\n'.join(lines[2:])
+        else:
+            description = ""
+            steps_raw_text = ""
+
 
     # Use the new, robust step parsing function
     parsed_steps = parse_steps_from_text(steps_raw_text)
+    print(f"DEBUG: parse_procedure_block - Parsed {len(parsed_steps)} steps.")
 
     # Extract a title from the first line of the description, or use a default
     title = description.split('\n')[0].strip() if description else f"Isolation Procedure {procedure_code}"
@@ -215,6 +268,15 @@ def search_isolation_procedure(payload: Input):
     text = payload.text
     query = (payload.query or "").strip()
     
+    print(f"DEBUG: Received query: '{query}'")
+    print(f"DEBUG: Received text length: {len(text)}")
+    print(f"DEBUG: Received text (first 500 chars): {text[:500]}...")
+
+    # Normalize the input text before processing
+    normalized_text = normalize_text_for_parsing(text)
+    print(f"DEBUG: Normalized text length: {len(normalized_text)}")
+    print(f"DEBUG: Normalized text (first 500 chars): {normalized_text[:500]}...")
+
     if not query:
         return Output(
             original_query=query,
@@ -234,20 +296,26 @@ def search_isolation_procedure(payload: Input):
     for keywords, code in error_to_procedure_map.items():
         if re.search(keywords, query, re.IGNORECASE):
             procedure_code_from_query = code
+            print(f"DEBUG: Inferred procedure code from query: {procedure_code_from_query}")
             break
     
     # If no inference, check if the query is a procedure code itself
     if not procedure_code_from_query:
         if re.match(r"MEXIP\d{2}", query, re.IGNORECASE):
             procedure_code_from_query = query.upper()
+            print(f"DEBUG: Query is a direct procedure code: {procedure_code_from_query}")
     
     # If a code was found (either by inference or direct query)
     if procedure_code_from_query:
-        procedure_block_text = find_procedure_block(text, procedure_code_from_query)
+        # Use normalized text for finding the block
+        procedure_block_text = find_procedure_block(normalized_text, procedure_code_from_query)
 
         if procedure_block_text:
+            print(f"DEBUG: Procedure block text found. Parsing details...")
             procedure_details = parse_procedure_block(procedure_block_text, procedure_code_from_query)
             suggested_action = get_suggested_action(query, procedure_details)
+            print(f"DEBUG: Procedure details: {procedure_details.dict()}")
+            print(f"DEBUG: Suggested action: {suggested_action}")
 
             return Output(
                 original_query=query,
@@ -256,8 +324,11 @@ def search_isolation_procedure(payload: Input):
                 procedure_details=procedure_details,
                 suggested_action=suggested_action
             )
+        else:
+            print(f"DEBUG: Procedure block text NOT found for {procedure_code_from_query}.")
 
     # If no procedure block was found after all attempts
+    print(f"DEBUG: Final Fallback - Procedure for query '{query}' not found or could not be inferred.")
     return Output(
         original_query=query,
         message=f"Procedure for query '{query}' not found or could not be inferred. Please try a specific procedure code (e.g., MEXIP01) or a more detailed error description.",
